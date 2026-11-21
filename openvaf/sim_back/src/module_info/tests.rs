@@ -326,3 +326,25 @@ fn bus_port_forms() {
     "#]]
     .assert_eq(&res);
 }
+
+#[test]
+fn mid_decl_and_typed_parameter_attributes() {
+    let src = indoc! {r#"
+        module test;
+            parameter real (* integer inherited_mfactor; *) m = 1.0;
+            parameter real (* desc="mid attr", units="m" *) width = 1e-6;
+            parameter real len = 2e-6 from (0:inf) (* desc="trailing attr"; units="m"; *);
+        endmodule
+    "#};
+    let db = CompilationDB::new_virtual(src).unwrap();
+    let modules = super::collect_modules(&db, false, &mut ConsoleSink::new(&db)).unwrap();
+    assert_eq!(modules.len(), 1);
+    let params: std::collections::HashMap<_, _> =
+        modules[0].params.iter().map(|(k, v)| (k.name(&db).to_string(), v)).collect();
+    assert!(params.contains_key("m"));
+    assert!(params["m"].is_instance);
+    assert_eq!(params["width"].description, "mid attr");
+    assert_eq!(params["width"].unit, "m");
+    assert_eq!(params["len"].description, "trailing attr");
+    assert_eq!(params["len"].unit, "m");
+}

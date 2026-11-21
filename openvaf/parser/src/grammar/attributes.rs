@@ -11,11 +11,15 @@ fn attr_list(p: &mut Parser, recovery: TokenSet) {
     let m = p.start();
     p.bump(T!["(*"]);
 
-    while !p.at_ts(TokenSet::new(&[EOF, T!["*)"]]).union(recovery)) {
+    while !p.at_ts(TokenSet::new(&[EOF, T!["*)"]]))
+        && ((p.at_ts(ATTR_TY_KW) && p.nth(1) == IDENT) || !p.at_ts(recovery))
+    {
         attr(p, recovery);
 
         if !p.at(T!["*)"]) {
-            p.expect_with(T![,], &[T![,], T!["*)"]]);
+            if !p.eat(T![;]) {
+                p.expect_with(T![,], &[T![,], T![;], T!["*)"]]);
+            }
         }
     }
 
@@ -23,10 +27,17 @@ fn attr_list(p: &mut Parser, recovery: TokenSet) {
     m.complete(p, ATTR_LIST);
 }
 
-const ATTR_RECOVERY_SET: TokenSet = TokenSet::new(&[T!["(*"], T!["*)"], T![=], T![,]]);
+const ATTR_RECOVERY_SET: TokenSet = TokenSet::new(&[T!["(*"], T!["*)"], T![=], T![,], T![;]]);
+const ATTR_TY_KW: TokenSet = TokenSet::new(&[INTEGER_KW, REAL_KW, STRING_KW]);
 
 fn attr(p: &mut Parser, recovery: TokenSet) {
     let m = p.start();
+
+    // Support Verilog-AMS / Spectre typed attribute declarations such as
+    // `(* integer inherited_mfactor; *)`.
+    if p.at_ts(ATTR_TY_KW) && p.nth(1) == IDENT {
+        p.bump_any();
+    }
 
     name_r(p, ATTR_RECOVERY_SET.union(recovery));
     if p.eat(T![=]) {

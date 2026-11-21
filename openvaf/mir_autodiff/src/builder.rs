@@ -270,7 +270,8 @@ impl<'a, 'u> DerivativeBuilder<'a, 'u> {
 
                 self.insert_conversions(inst);
             }
-            InstructionData::Binary { opcode: Opcode::Pow, args: [base, _] } => {
+            InstructionData::Binary { opcode: Opcode::Pow, args: [base, _] }
+            | InstructionData::Unary { opcode: Opcode::Sqrt, arg: base } => {
                 if let Some(derivatives) = derivatives {
                     let inst = self.dst.0;
                     let is_base_zero = self.ins().feq(base, F_ZERO);

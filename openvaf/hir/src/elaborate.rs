@@ -51,6 +51,31 @@ use tokens::lexer::TokenKind;
 
 use crate::db::CompilationDB;
 
+/// Built-in Spectre / SPICE structural primitives that may be instantiated in
+/// Verilog-A modules without an explicit `module` definition in the same file.
+/// User-defined modules with the same name always take precedence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuiltinPrimitive {
+    Resistor,
+    Capacitor,
+    Inductor,
+    Vsource,
+    Isource,
+}
+
+impl BuiltinPrimitive {
+    fn from_name(name: &Name) -> Option<Self> {
+        match &**name {
+            "resistor" => Some(Self::Resistor),
+            "capacitor" => Some(Self::Capacitor),
+            "inductor" => Some(Self::Inductor),
+            "vsource" => Some(Self::Vsource),
+            "isource" => Some(Self::Isource),
+            _ => None,
+        }
+    }
+}
+
 /// Entry point, called once from [`CompilationDB::new`]. No-op (and cheap:
 /// one `item_tree` lookup) for the overwhelming majority of files, which
 /// contain no instantiations at all.
@@ -68,15 +93,17 @@ pub(crate) fn elaborate_instantiations(db: &mut CompilationDB) -> anyhow::Result
     }
 
     // Cycles cannot be flattened, and unresolved child modules must not be
-    // silently dropped. Keep the original file so the normal diagnostic
-    // path reports these errors against their source instantiations.
+    // silently dropped (except built-in structural primitives such as
+    // `resistor`, which this pass lowers directly). Keep the original file so
+    // the normal diagnostic path reports genuine errors against their source
+    // instantiations.
     let def_map = db.def_map(root_file);
-    if def_map.diagnostics.iter().any(|d| {
-        matches!(
-            d,
-            DefDiagnostic::CyclicInstantiation { .. }
-                | DefDiagnostic::UnknownInstantiatedModule { .. }
-        )
+    if def_map.diagnostics.iter().any(|d| match d {
+        DefDiagnostic::CyclicInstantiation { .. } => true,
+        DefDiagnostic::UnknownInstantiatedModule { module, .. } => {
+            BuiltinPrimitive::from_name(module).is_none()
+        }
+        _ => false,
     }) {
         return Ok(());
     }
@@ -667,7 +694,12 @@ impl ElabCtx<'_> {
         prefix: &str,
     ) -> String {
         let Some(module_name) = inst.module().map(|n| n.as_name()) else { return String::new() };
-        let Some(&target_id) = self.by_name.get(&module_name) else { return String::new() };
+        let Some(&target_id) = self.by_name.get(&module_name) else {
+            if let Some(prim) = BuiltinPrimitive::from_name(&module_name) {
+                return self.expand_builtin_primitive(prim, parent_id, inst, scope, prefix);
+            }
+            return String::new();
+        };
         let target = self.tree[target_id].clone();
         let target_ast = self.module_ast(target.ast_id);
         let parent = self.tree[parent_id].clone();
@@ -729,6 +761,176 @@ impl ElabCtx<'_> {
                     &param_binding,
                 ));
                 out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Lowers a built-in Spectre / SPICE 2-terminal structural primitive
+    /// (`resistor`, `capacitor`, `inductor`, `vsource`, `isource`) into
+    /// equivalent inline Verilog-A `analog` contribution statements.
+    fn expand_builtin_primitive(
+        &mut self,
+        prim: BuiltinPrimitive,
+        parent_id: ItemTreeId<TreeModule>,
+        inst: &ast::Instantiation,
+        scope: &Scope,
+        prefix: &str,
+    ) -> String {
+        let parent = self.tree[parent_id].clone();
+        let mut params: HashMap<String, String> = HashMap::new();
+        let mut positional_params: Vec<String> = Vec::new();
+        if let Some(overrides) = inst.param_overrides() {
+            for assign in overrides.param_assigns() {
+                if let Some(val) = assign.val() {
+                    let expr = apply_rename(&val.syntax().text().to_string(), scope);
+                    if let Some(name) = assign.name() {
+                        params.insert(name.as_name().to_string().to_ascii_lowercase(), expr);
+                    } else {
+                        positional_params.push(expr);
+                    }
+                }
+            }
+        }
+
+        let mut out = String::new();
+        for unit in inst.instance_units() {
+            let Some(unit_name) = unit.name() else { continue };
+            let base_name = unit_name.as_name();
+
+            let mut p_raw: Option<String> = None;
+            let mut n_raw: Option<String> = None;
+            if let Some(port_conns) = unit.port_conns() {
+                let conns: Vec<_> = port_conns.port_conns().collect();
+                if conns.iter().all(|c| c.name().is_none()) {
+                    if let Some(net) = conns.first().and_then(|c| c.net()) {
+                        p_raw = Some(net.syntax().text().to_string());
+                    }
+                    if let Some(net) = conns.get(1).and_then(|c| c.net()) {
+                        n_raw = Some(net.syntax().text().to_string());
+                    }
+                } else {
+                    for conn in &conns {
+                        if let (Some(name), Some(net)) = (conn.name(), conn.net()) {
+                            let lname = name.as_name().to_string().to_ascii_lowercase();
+                            let text = net.syntax().text().to_string();
+                            match lname.as_str() {
+                                "p" | "plus" | "pos" | "t1" | "a" | "1" => p_raw = Some(text),
+                                "n" | "minus" | "neg" | "t2" | "b" | "2" => n_raw = Some(text),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+
+            let indices: Vec<Option<i32>> = match unit.width().and_then(|r| fold_width_range(&r)) {
+                Some((msb, lsb)) => {
+                    let (lo, hi) = if msb <= lsb { (msb, lsb) } else { (lsb, msb) };
+                    (lo..=hi).map(Some).collect()
+                }
+                None => vec![None],
+            };
+
+            for (elem_pos, idx) in indices.iter().enumerate() {
+                let child_prefix = match idx {
+                    Some(i) => format!("{prefix}{base_name}_{i}__"),
+                    None => format!("{prefix}{base_name}__"),
+                };
+                let resolve_term = |raw: &Option<String>,
+                                    fallback_name: &str,
+                                    out_buf: &mut String|
+                 -> String {
+                    if let Some(text) = raw {
+                        let sliced = if indices.len() > 1 {
+                            if let Some(bus) = find_matching_caller_bus(&parent, text, indices.len())
+                            {
+                                let (caller_lo, _) = bus.min_max();
+                                let bit = caller_lo + elem_pos as i32;
+                                format!("{text}[{bit}]")
+                            } else {
+                                text.clone()
+                            }
+                        } else {
+                            text.clone()
+                        };
+                        apply_rename(&sliced, scope)
+                    } else {
+                        let fresh = format!("{child_prefix}open__{fallback_name}");
+                        out_buf.push_str(&format!("electrical {fresh};\n"));
+                        fresh
+                    }
+                };
+                let p = resolve_term(&p_raw, "p", &mut out);
+                let n = resolve_term(&n_raw, "n", &mut out);
+
+                let m_expr = params.get("m");
+                let m_prefix = m_expr.map(|m| format!("({m}) * ")).unwrap_or_default();
+
+                match prim {
+                    BuiltinPrimitive::Resistor => {
+                        let r_base = params
+                            .get("r")
+                            .or_else(|| positional_params.first())
+                            .map(String::as_str)
+                            .unwrap_or("1.0");
+                        let r_eff = match (params.get("tc1"), params.get("tc2")) {
+                            (None, None) => format!("({r_base})"),
+                            (tc1, tc2) => {
+                                let tnom = params.get("tnom").map(String::as_str).unwrap_or("27.0");
+                                let dt = format!("($temperature - (({tnom}) + 273.15))");
+                                let mut scale = String::from("1.0");
+                                if let Some(c1) = tc1 {
+                                    scale.push_str(&format!(" + ({c1}) * {dt}"));
+                                }
+                                if let Some(c2) = tc2 {
+                                    scale.push_str(&format!(" + ({c2}) * {dt} * {dt}"));
+                                }
+                                format!("(({r_base}) * ({scale}))")
+                            }
+                        };
+                        out.push_str(&format!(
+                            "analog begin\n    if ({r_eff} != 0.0)\n        I({p}, {n}) <+ {m_prefix}V({p}, {n}) / {r_eff};\n    else\n        V({p}, {n}) <+ 0.0;\nend\n"
+                        ));
+                    }
+                    BuiltinPrimitive::Capacitor => {
+                        let c_expr = params
+                            .get("c")
+                            .or_else(|| positional_params.first())
+                            .map(String::as_str)
+                            .unwrap_or("0.0");
+                        out.push_str(&format!(
+                            "analog begin\n    I({p}, {n}) <+ ddt({m_prefix}({c_expr}) * V({p}, {n}));\nend\n"
+                        ));
+                    }
+                    BuiltinPrimitive::Inductor => {
+                        let l_expr = params
+                            .get("l")
+                            .or_else(|| positional_params.first())
+                            .map(String::as_str)
+                            .unwrap_or("0.0");
+                        let m_div = m_expr.map(|m| format!(" / ({m})")).unwrap_or_default();
+                        out.push_str(&format!(
+                            "analog begin\n    V({p}, {n}) <+ ddt((({l_expr}){m_div}) * I({p}, {n}));\nend\n"
+                        ));
+                    }
+                    BuiltinPrimitive::Vsource => {
+                        let dc_expr = params
+                            .get("dc")
+                            .or_else(|| positional_params.first())
+                            .map(String::as_str)
+                            .unwrap_or("0.0");
+                        out.push_str(&format!("analog begin\n    V({p}, {n}) <+ ({dc_expr});\nend\n"));
+                    }
+                    BuiltinPrimitive::Isource => {
+                        let dc_expr = params
+                            .get("dc")
+                            .or_else(|| positional_params.first())
+                            .map(String::as_str)
+                            .unwrap_or("0.0");
+                        out.push_str(&format!("analog begin\n    I({p}, {n}) <+ ({dc_expr});\nend\n"));
+                    }
+                }
             }
         }
         out
@@ -1074,5 +1276,46 @@ endmodule
             };
             assert!(error.contains(message), "{error}");
         }
+    }
+
+    #[test]
+    fn builtin_spectre_primitives_elaborate_losslessly() {
+        let source = r#"
+`include "disciplines.vams"
+module top(p, n);
+    inout p, n;
+    electrical p, n, mid;
+    parameter real rwire = 100.0;
+    parameter real cpar = 1e-12;
+    resistor #(.r(rwire)) r1 (p, mid);
+    capacitor #(.c(cpar)) c1 (mid, n);
+    resistor #(.r(10M)) r2 (mid, n);
+endmodule
+"#;
+        let out = flattened(source);
+        assert!(out.contains("I(p, mid) <+ V(p, mid) / (rwire);"), "{out}");
+        assert!(out.contains("V(p, mid) <+ 0.0;"), "{out}");
+        assert!(out.contains("I(mid, n) <+ ddt((cpar) * V(mid, n));"), "{out}");
+        assert!(out.contains("I(mid, n) <+ V(mid, n) / (10M);"), "{out}");
+    }
+
+    #[test]
+    fn user_defined_resistor_overrides_builtin_primitive() {
+        let source = r#"
+`include "disciplines.vams"
+module resistor(a, b);
+    inout a, b;
+    electrical a, b;
+    parameter real r = 1.0;
+    analog I(a, b) <+ 2.0 * V(a, b) / r;
+endmodule
+module top(p, n);
+    inout p, n;
+    electrical p, n;
+    resistor #(.r(50.0)) r1 (p, n);
+endmodule
+"#;
+        let out = flattened(source);
+        assert!(out.contains("2.0 * V(p, n)"), "{out}");
     }
 }

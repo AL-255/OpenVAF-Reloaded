@@ -1151,3 +1151,47 @@ fn subgraph() {
 
     check_simple(src, expect);
 }
+
+#[test]
+fn sqrt_zero_derivative_guard() {
+    // f(x) = x / (1 + sqrt(x))
+    // f'(0) = 1.0 (must not produce 0 * Inf = NaN)
+    // f'(4) = (1*(1+2) - 4*(1/4)) / 9 = 2/9
+    let src = r##"
+        function %bar(v10) {
+            fn0 = const fn %ddx_v10(1) -> 1
+            v20 = fconst 0x1.0000000000000p0
+
+        block0:
+            v12 = sqrt v10
+            v13 = fadd v20, v12
+            v14 = fdiv v10, v13
+            v15 = call fn0 (v14)
+            v100 = optbarrier v15
+        }"##;
+    for (x, expected) in [(0.0_f64, 1.0_f64), (4.0_f64, 2.0_f64 / 9.0_f64)] {
+        let (mut func, _) = parse_function(src).unwrap();
+        let mut cfg = ControlFlowGraph::new();
+        cfg.compute(&func);
+        let unknowns = [10u32.into()].into_iter().collect();
+        let mut call1 = HybridBitSet::new_empty();
+        call1.insert(0u32.into(), 1);
+        let ddx_calls = [(0u32.into(), (call1, HybridBitSet::new_empty()))].into_iter().collect();
+        let unknowns = KnownDerivatives { unknowns, ddx_calls };
+        let mut dom_tree = DominatorTree::default();
+        dom_tree.compute(&func, &cfg, true, false, true);
+        auto_diff(&mut func, &dom_tree, &unknowns, &[]);
+        let mut interpret = Interpreter::new(
+            &func,
+            TiSlice::from_ref(&[]),
+            TiSlice::from_ref(Data::from_f64_slice(&[x])),
+        );
+        interpret.run();
+        let val: f64 = interpret.state.read(100u32.into());
+        assert!(
+            val.approx_eq(expected, F64Margin::default().epsilon(10f64 * f64::EPSILON)),
+            "x={x}: got {val}, expected {expected}\n{}",
+            func.to_debug_string()
+        );
+    }
+}

@@ -161,7 +161,8 @@ impl ModuleInfo {
                     });
                     let is_instance = match type_.as_deref() {
                         Some("instance") => true,
-                        Some("model") | None => false,
+                        Some("model") => false,
+                        None => param.get_attr(db, &ast, "inherited_mfactor").is_some(),
                         Some(found) => {
                             let attr = type_attr.unwrap();
                             add_diagnostic(

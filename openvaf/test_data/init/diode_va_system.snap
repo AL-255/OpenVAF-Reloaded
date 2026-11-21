@@ -13,14 +13,14 @@
     ),
     cslot1: (
         (
-            Some(ClassId(193)),
+            Some(ClassId(196)),
             0,
         ),
         Real,
     ),
     cslot2: (
         (
-            Some(ClassId(202)),
+            Some(ClassId(205)),
             0,
         ),
         Real,

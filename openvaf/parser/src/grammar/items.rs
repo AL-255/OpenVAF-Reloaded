@@ -65,7 +65,7 @@ pub(super) fn decl_list(
         p.error(p.unexpected_token_msg(IDENT));
     } else {
         while !p.at_ts(recovery) && parse_entry(p) {
-            if !p.at(terminator) {
+            if !p.at(terminator) && !p.at(T!["(*"]) {
                 p.expect_with(T![,], &[T![,], terminator]);
             }
         }
@@ -82,7 +82,9 @@ pub(super) fn var_decl(p: &mut Parser, m: Marker) {
     if p.at(T!['[']) {
         width_range(p);
     }
+    attrs(p, MODULE_ITEM_OR_ATTR_RECOVERY);
     decl_list(p, T![;], var, MODULE_ITEM_OR_ATTR_RECOVERY);
+    attrs(p, MODULE_ITEM_OR_ATTR_RECOVERY);
     p.eat(T![;]);
     m.complete(p, VAR_DECL);
 }
@@ -110,7 +112,9 @@ fn var(p: &mut Parser) -> bool {
 pub(super) fn parameter_decl(p: &mut Parser, m: Marker) {
     p.bump_any();
     eat_ty(p);
+    attrs(p, MODULE_ITEM_OR_ATTR_RECOVERY);
     decl_list(p, T![;], parameter, MODULE_ITEM_OR_ATTR_RECOVERY);
+    attrs(p, MODULE_ITEM_OR_ATTR_RECOVERY);
     p.eat(T![;]);
     m.complete(p, PARAM_DECL);
 }
